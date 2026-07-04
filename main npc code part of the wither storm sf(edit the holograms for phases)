@@ -1,0 +1,976 @@
+--@name Minecraft Wither Storm
+--@author Markiz (Storm Edit)
+-- author STEAM_0:1:54066003
+--@shared
+-- version 2.2.6
+
+local Radius = 2500
+local Health = 5000
+local HealthTriggerShield = 2500
+local MaxTakeDamage = 500
+
+local AiFlyEnabled = true
+local FlyVelocityMax = 12
+local FlyHomingAccuracy = 1
+
+local IgnorePlayers = false
+
+local AutoHealAfterTime = 5
+local AutoHealDelay = 1
+local AutoHealAmount = 100
+
+local LockDamageTime = 0.5
+local PreparationTime = 10
+local DeathTime = 8
+
+local ExplodeModels = {
+    "models/props_phx/misc/potato_launcher_explosive.mdl",
+    "models/props_junk/propane_tank001a.mdl",
+    "models/props_phx/oildrum001_explosive.mdl",
+    "models/props_c17/oildrum001_explosive.mdl",
+}
+local TargetHomingAccuracy = 0.7
+local PropDamageMode = true
+local Damage = 40
+local HeadFireVelocity = 25
+local MinRandomFire = 0.5
+local MaxRandomFire = 1.8
+local HeadFireLifeTime = 10
+
+local SoundVolumeMain = 1
+local SoundVolumeHurt = 1
+local SoundVolumeShoot = 0.5
+local SoundVolumeSpawn = 7
+local SoundVolumeDeath = 7
+local Speed = 0.8
+local AgainLoadSoundDelay = 1
+
+
+local RenderRadius = 8000
+local RenderMaxAlpha = 1.0
+local RenderOffset = 8
+
+local Model = "models/hunter/blocks/cube4x4x4.mdl" 
+local E = chip()
+local Prop_Base, Holo_Base, _propPhysObj
+
+local _health = 0
+local _isPreparating = true
+local _isAlive = true
+
+
+function getFrameTime()
+    return timer.frametime() * 30
+end
+
+
+if SERVER then
+    
+    local _oldLockDamageTime = timer.systime()
+    local _lastTakeDamage = timer.systime()
+    
+    -- Adjusted eye sizes globally to scale nicely with smaller heads
+    local _eyeSize = Vector(2.8, 3.37, 2.8)
+    local _eyeClosedSize = Vector(2.8, 3.37, 0.1)
+    
+    local _activeHeadFires = {}
+    local _boneShields = {}
+    local _state = 1
+    
+    local _wanderPos = nil
+    local _nextWanderTime = 0
+    
+    local _growthScale = 1.0
+    local _maxGrowthScale = 6.0
+    
+    function explodeTo(pos)
+        while #ExplodeModels > 0 do
+            local succeed = pcall(function()
+                local p = prop.create(pos, Angle(), ExplodeModels[1])
+                p._isSF = true
+                p:setNoDraw(true)
+                p:breakEnt()
+            end)
+            
+            if succeed then return end
+            table.remove(ExplodeModels, 1)
+        end
+    end
+    
+    -----------------------------------------------------------------
+    local HeadFire = class("HeadFire")
+    
+    function HeadFire:initialize(pos, propBase, target, propDamageMode)
+        self.propBase = propBase or nil
+        self.target = target or nil
+        self.damage = Damage or nil
+        self.isExploded = false
+        self.isRemoved = false
+        self.propDamageMode = propDamageMode
+        self.lastLifeTime = timer.systime() + HeadFireLifeTime
+        self.forward = (self.target:obbCenterW()-pos):getNormalized()
+        
+        self.head = hologram.create(pos, self.forward and self.forward:getAngle() or Angle(), "models/holograms/cube.mdl", Vector(3.5, 3.5, 3.0))
+        self.head_eye1 = hologram.create(self.head:localToWorld(Vector(12.5, 0, 0)), self.head:getAngles(), "models/holograms/cube.mdl", Vector(1.0, 1.2, 1.0))
+        self.head_mouth = hologram.create(self.head:localToWorld(Vector(12.5, 0, -8)), self.head:getAngles(), "models/holograms/cube.mdl", Vector(1.0, 3.0, 0.2))
+        
+        self.head_eye1:setParent(self.head)
+        self.head_mouth:setParent(self.head)
+        
+        self.head:setColor(Color(20,15,25))
+        self.head_eye1:setColor(Color(200,50,255))
+        self.head_mouth:setColor(Color(255,255,255))
+    end
+    
+    
+    function HeadFire:hide()
+        self.head_eye1:setColor(Color(0,0,0,0))
+        self.head_mouth:setColor(Color(0,0,0,0))
+        self.head:setColor(Color(0,0,0,0))
+    end
+    
+    function HeadFire:destroy()
+        self.head_eye1:remove()
+        self.head_mouth:remove()
+        self.head:remove()
+        self.isRemoved = true
+    end
+    
+    function HeadFire:explode()
+        if self.propDamageMode then
+            explodeTo(self.head:getPos())
+            self:destroy()
+            return
+        else
+            local plys = find.inSphere(self.head:getPos(), 250, function(ent)
+                return ent:isPlayer()
+            end)
+            for i, ply in ipairs(plys) do
+                pcall(function()
+                    ply:applyDamage(self.damage, chip(), chip())
+                end)
+            end
+            self.head:emitSound('Plastic_Barrel.BulletImpact', 100, 100, 1)
+            self:hide()
+            timer.simple(2, function()
+                self:destroy()
+            end)
+        end
+        self.isExploded = true
+    end
+    
+    function HeadFire:think()
+        if not self.isExploded and not isValid(self.target) or self.lastLifeTime < timer.systime() then
+            self:destroy()
+            return
+        end
+        local pos = self.head:getPos()
+        local forwardToTarget = (self.target:obbCenterW()-pos):getNormalized()
+        self.forward = math.lerpVector(TargetHomingAccuracy/10, self.head:getForward(), forwardToTarget)
+        local nextPos = pos + self.forward * HeadFireVelocity * getFrameTime()
+        
+        local tr = trace.trace(pos, nextPos, {self.propBase}, MASK.ALL, nil, false)
+        if isValid(tr.Entity) or tr.HitWorld or self.target:obbCenterW():getDistance(pos) < 50 then
+            self:explode()
+            return
+        end
+        
+        self.head:setPos(nextPos)
+        self.head:setAngles(self.forward:getAngle())
+    end
+    -----------------------------------------------------------------
+    
+    function createShieldForBone(increasePercent, ...)
+        local args = {...}
+        for i, holo in ipairs(args) do
+            if isValid(holo) then
+                local holo_shield = hologram.create(holo:getPos(), holo:getAngles(), "models/holograms/cube.mdl", holo:getScale() * (1 + increasePercent/100))
+                holo_shield:setMaterial("models/effects/comball_sphere")
+                holo_shield:setParent(holo)
+                table.insert(_boneShields, holo_shield)
+            end
+        end
+    end
+    
+    function setEnableShield(value)
+        local color = value and Color(255,255,255) or Color(255,255,255, 0)
+        
+        for i, h in ipairs(_boneShields) do
+            if isValid(h) then h:setColor(color) end
+        end
+    end
+
+    
+    local li = find.inSphere(E:getPos(), 50, function(ent)
+        return ent:getModel() == Model and ent:getOwner() == owner()
+    end)
+    if #li > 0 then
+        Prop_Base = find.closest(li, E:getPos())
+    else
+        Prop_Base = prop.create(E:localToWorld(Vector(0,0,50)), E:getAngles(), Model, true)
+    end
+    if Prop_Base:getOwner() == owner() then
+        Prop_Base:setPos(E:localToWorld(Vector(0,0,50)))
+        Prop_Base:setAngles(E:getAngles())
+        Prop_Base:setColor(Color(0,0,0,0))
+        Prop_Base:setMaterial("Models/effects/vol_light001")
+    end
+    _propPhysObj = Prop_Base:getPhysicsObject()
+
+    
+    Holo_Base = hologram.create(Prop_Base:getPos(), Prop_Base:getAngles(), "models/holograms/cube.mdl")
+    Holo_Base:setColor(Color(0,0,0,0))
+    Holo_Base:setParent(Prop_Base)
+    
+    local Holo_Spine = hologram.create(Holo_Base:getPos(), Holo_Base:localToWorldAngles(Angle(20,0,0)), "models/holograms/cube.mdl", Vector(21.25, 21.25, 50.0))
+    Holo_Spine:setParent(Holo_Base)
+
+    local Holo_Growth = hologram.create(Holo_Spine:localToWorld(Vector(-40, 0, 10)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(5, 5, 5))
+    Holo_Growth:setParent(Holo_Spine)
+
+    local Holo_Spine_Rib1 = hologram.create(Holo_Spine:localToWorld(Vector(0,0,-137.5)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(12.5, 45.0, 8.75))
+    local Holo_Spine_Rib2 = hologram.create(Holo_Spine:localToWorld(Vector(0,0,-37.5)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(13.75, 50.0, 8.75))
+    local Holo_Spine_Rib3 = hologram.create(Holo_Spine:localToWorld(Vector(0,0,75.0)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(15.0, 55.0, 8.75))
+    Holo_Spine_Rib1:setParent(Holo_Spine)
+    Holo_Spine_Rib2:setParent(Holo_Spine)
+    Holo_Spine_Rib3:setParent(Holo_Spine)
+
+    local Holo_FlankL = hologram.create(Holo_Spine:localToWorld(Vector(20, 55, -37.5)), Holo_Spine:localToWorldAngles(Angle(0, 0, 15)), "models/holograms/cube.mdl", Vector(7.5, 5.0, 20.0))
+    local Holo_FlankR = hologram.create(Holo_Spine:localToWorld(Vector(20, -55, -37.5)), Holo_Spine:localToWorldAngles(Angle(0, 0, -15)), "models/holograms/cube.mdl", Vector(7.5, 5.0, 20.0))
+    Holo_FlankL:setParent(Holo_Spine)
+    Holo_FlankR:setParent(Holo_Spine)
+
+    local Holo_BackSpikeL = hologram.create(Holo_Spine:localToWorld(Vector(-50, 55, 30.0)), Holo_Spine:localToWorldAngles(Angle(0, 25, -10)), "models/holograms/cube.mdl", Vector(15.0, 15.0, 35.0))
+    local Holo_BackSpikeR = hologram.create(Holo_Spine:localToWorld(Vector(-50, -55, 30.0)), Holo_Spine:localToWorldAngles(Angle(0, -25, 10)), "models/holograms/cube.mdl", Vector(15.0, 15.0, 35.0))
+    Holo_BackSpikeL:setParent(Holo_Spine)
+    Holo_BackSpikeR:setParent(Holo_Spine)
+
+    local Holo_BellyUpper = hologram.create(Holo_Spine:localToWorld(Vector(25, 0, -50.0)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(17.5, 30.0, 15.0))
+    local Holo_BellyLower = hologram.create(Holo_Spine:localToWorld(Vector(15, 0, -130.0)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(13.75, 22.5, 15.0))
+    local Holo_LowerBody3 = hologram.create(Holo_Spine:localToWorld(Vector(5, 0, -275.0)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(10.0, 16.25, 15.0))
+    local Holo_LowerBody4 = hologram.create(Holo_Spine:localToWorld(Vector(-5, 0, -375.0)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(6.25, 10.0, 15.0))
+    Holo_BellyUpper:setParent(Holo_Spine)
+    Holo_BellyLower:setParent(Holo_Spine)
+    Holo_LowerBody3:setParent(Holo_Spine)
+    Holo_LowerBody4:setParent(Holo_Spine)
+    
+    local Holo_Tail = hologram.create(Holo_Spine:localToWorld(Vector(-50, 0, -462.5)), Holo_Spine:localToWorldAngles(Angle(50, 0, 0)), "models/holograms/cube.mdl", Vector(2.5, 2.5, 30.0))
+    local Holo_Tail_Bone = hologram.create(Holo_Tail:localToWorld(Vector(0, 0, 87.5)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(0.5, 2.5, 0.5))
+    Holo_Tail_Bone:setParent(Holo_Base)
+    Holo_Tail_Bone:setColor(Color(0, 0, 0, 0))
+    Holo_Tail:setParent(Holo_Tail_Bone)
+
+    -- === TENTACLE 1 ===
+    local Holo_Tentacle1_Bone = hologram.create(Holo_Spine:localToWorld(Vector(-70.0, 380.0, -50.0)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(1, 1, 1))
+    Holo_Tentacle1_Bone:setParent(Holo_Spine)
+    Holo_Tentacle1_Bone:setColor(Color(0,0,0,0))
+    
+    local Holo_Tentacle1 = hologram.create(Vector(), Angle(0, 45, 0), "models/holograms/cube.mdl", Vector(3.75, 3.75, 42.0))
+    Holo_Tentacle1:setParent(Holo_Tentacle1_Bone)
+    Holo_Tentacle1:setLocalPos(Vector(0,0,0))
+
+    -- === TENTACLE 2 (FIXED BASE ROTATION) ===
+    local Holo_Tentacle2_Bone = hologram.create(Holo_Spine:localToWorld(Vector(-30.0, -380.0, 120.0)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(1, 1, 1))
+    Holo_Tentacle2_Bone:setParent(Holo_Spine)
+    Holo_Tentacle2_Bone:setColor(Color(0,0,0,0))
+    
+    local Holo_Tentacle2 = hologram.create(Vector(), Angle(-75, 0, 0), "models/holograms/cube.mdl", Vector(3.75, 3.75, 42.0))
+    Holo_Tentacle2:setParent(Holo_Tentacle2_Bone)
+    Holo_Tentacle2:setLocalPos(Vector(0, 0, 150)) 
+
+    -- === TENTACLE 3 ===
+    local Holo_Tentacle3_Bone = hologram.create(Holo_Spine:localToWorld(Vector(-140.0, 0.0, -90.0)), Holo_Spine:getAngles(), "models/holograms/cube.mdl", Vector(1, 1, 1))
+    Holo_Tentacle3_Bone:setParent(Holo_Spine)
+    Holo_Tentacle3_Bone:setColor(Color(0,0,0,0))
+    
+    local Holo_Tentacle3 = hologram.create(Vector(), Angle(35, 0, 0), "models/holograms/cube.mdl", Vector(3.75, 3.75, 42.0))
+    Holo_Tentacle3:setParent(Holo_Tentacle3_Bone)
+    Holo_Tentacle3:setLocalPos(Vector(0,0,0))
+    
+    local Holo_Clavicle = hologram.create(Holo_Base:localToWorld(Vector(37.5,0,212.5)), Holo_Base:getAngles(), "models/holograms/cube.mdl", Vector(16.25, 80.0, 12.5))
+    Holo_Clavicle:setParent(Holo_Base)
+
+    local Holo_ShoulderL = hologram.create(Holo_Clavicle:localToWorld(Vector(20, 150, 37.5)), Holo_Clavicle:getAngles(), "models/holograms/cube.mdl", Vector(21.25, 21.25, 21.25))
+    local Holo_ShoulderR = hologram.create(Holo_Clavicle:localToWorld(Vector(20, -150, 37.5)), Holo_Clavicle:getAngles(), "models/holograms/cube.mdl", Vector(21.25, 21.25, 21.25))
+    Holo_ShoulderL:setParent(Holo_Clavicle)
+    Holo_ShoulderR:setParent(Holo_Clavicle)
+
+    local Holo_ShoulderSpikeL = hologram.create(Holo_ShoulderL:localToWorld(Vector(-5, 12.5, 30.0)), Holo_ShoulderL:localToWorldAngles(Angle(30, 0, 0)), "models/holograms/cube.mdl", Vector(5.0, 5.0, 15.0))
+    local Holo_ShoulderSpikeR = hologram.create(Holo_ShoulderR:localToWorld(Vector(-5, -12.5, 30.0)), Holo_ShoulderR:localToWorldAngles(Angle(-30, 0, 0)), "models/holograms/cube.mdl", Vector(5.0, 5.0, 15.0))
+    Holo_ShoulderSpikeL:setParent(Holo_ShoulderL)
+    Holo_ShoulderSpikeR:setParent(Holo_ShoulderR)
+    
+    -- === HEAD 1 (SMALLER) ===
+    local Holo_Head1 = hologram.create(Holo_Clavicle:localToWorld(Vector(112.5, 0, 50.0)), Holo_Clavicle:getAngles(), "models/holograms/cube.mdl", Vector(14.0, 14.0, 13.1))
+    local Holo_Head1_Eye1 = hologram.create(Holo_Head1:localToWorld(Vector(71.0, 0, 4)), Holo_Head1:getAngles(), "models/holograms/cube.mdl", _eyeSize)
+    local Holo_Head1_Mouth = hologram.create(Holo_Head1:localToWorld(Vector(71.0, 0, -30.0)), Holo_Head1:getAngles(), "models/holograms/cube.mdl", Vector(3.75, 13.1, 1.0))
+    Holo_Head1:setParent(Holo_Base)
+    Holo_Head1_Eye1:setParent(Holo_Head1)
+    Holo_Head1_Mouth:setParent(Holo_Head1)
+    
+    -- === HEAD 2 (SMALLER) ===
+    local Holo_Head2 = hologram.create(Holo_Clavicle:localToWorld(Vector(87.5, 225, 12.5)), Holo_Clavicle:getAngles(), "models/holograms/cube.mdl", Vector(10.3, 10.3, 9.4))
+    local Holo_Head2_Eye1 = hologram.create(Holo_Head2:localToWorld(Vector(52.5, 0, 2.0)), Holo_Head2:getAngles(), "models/holograms/cube.mdl", Vector(3.75, 2.8, 2.8))
+    local Holo_Head2_Mouth = hologram.create(Holo_Head2:localToWorld(Vector(52.5, 0, -22.5)), Holo_Head2:getAngles(), "models/holograms/cube.mdl", Vector(2.8, 9.4, 0.75))
+    Holo_Head2:setParent(Holo_Base)
+    Holo_Head2_Eye1:setParent(Holo_Head2)
+    Holo_Head2_Mouth:setParent(Holo_Head2)
+    
+    -- === HEAD 3 (SMALLER) ===
+    local Holo_Head3 = hologram.create(Holo_Clavicle:localToWorld(Vector(87.5, -225, 12.5)), Holo_Clavicle:getAngles(), "models/holograms/cube.mdl", Vector(10.3, 10.3, 9.4))
+    local Holo_Head3_Eye1 = hologram.create(Holo_Head3:localToWorld(Vector(52.5, 0, 2.0)), Holo_Head3:getAngles(), "models/holograms/cube.mdl", Vector(3.75, 2.8, 2.8))
+    local Holo_Head3_Mouth = hologram.create(Holo_Head3:localToWorld(Vector(52.5, 0, -22.5)), Holo_Head3:getAngles(), "models/holograms/cube.mdl", Vector(2.8, 9.4, 0.75))
+    Holo_Head3:setParent(Holo_Base)
+    Holo_Head3_Eye1:setParent(Holo_Head3)
+    Holo_Head3_Mouth:setParent(Holo_Head3)
+    
+    local bodyParts = {
+        Holo_Spine, Holo_Spine_Rib1, Holo_Spine_Rib2, Holo_Spine_Rib3, Holo_FlankL, Holo_FlankR,
+        Holo_BackSpikeL, Holo_BackSpikeR, Holo_BellyUpper, Holo_BellyLower, Holo_LowerBody3, Holo_LowerBody4,
+        Holo_Tail, Holo_Tentacle1, Holo_Tentacle2, Holo_Tentacle3, Holo_Clavicle, Holo_ShoulderL, Holo_ShoulderR, 
+        Holo_ShoulderSpikeL, Holo_ShoulderSpikeR, Holo_Head1, Holo_Head2, Holo_Head3, Holo_Growth
+    }
+    
+    createShieldForBone(30, unpack(bodyParts))
+    setEnableShield(true)
+    
+    function setBodyColor(color)
+        for _, part in ipairs(bodyParts) do
+            if isValid(part) then part:setColor(color) end
+        end
+    end
+    
+    function setEyeColor(color)
+        if isValid(Holo_Head1_Eye1) then Holo_Head1_Eye1:setColor(color) end
+        if isValid(Holo_Head2_Eye1) then Holo_Head2_Eye1:setColor(color) end
+        if isValid(Holo_Head3_Eye1) then Holo_Head3_Eye1:setColor(color) end
+    end
+
+    function setMouthColor(color)
+        if isValid(Holo_Head1_Mouth) then Holo_Head1_Mouth:setColor(color) end
+        if isValid(Holo_Head2_Mouth) then Holo_Head2_Mouth:setColor(color) end
+        if isValid(Holo_Head3_Mouth) then Holo_Head3_Mouth:setColor(color) end
+    end
+    
+    function hideHolos()
+        setBodyColor(Color(0,0,0,0))
+        setEyeColor(Color(0,0,0,0))
+        setMouthColor(Color(0,0,0,0))
+    end
+    
+    setBodyColor(Color(18, 14, 24))
+    setEyeColor(Color(230, 80, 255))
+    setMouthColor(Color(255, 255, 255))
+    
+    
+    function setEyesState(scale)
+        if not isValid(Holo_Head1_Eye1) then return end
+        Holo_Head1_Eye1:setScale(scale)
+        Holo_Head2_Eye1:setScale(scale)
+        Holo_Head3_Eye1:setScale(scale)
+    end
+    
+    function closeEyes()
+        setEyesState(_eyeClosedSize)
+    end
+    
+    function openEyes()
+        setEyesState(_eyeSize)
+    end
+    
+    function sendHealth()
+        net.start("hurt")
+        net.writeFloat(_health)
+        net.send()
+    end
+    
+    local _targets = {
+        [1] = nil,
+        [2] = nil,
+        [3] = nil,
+    }
+    local _heads = { Holo_Head1, Holo_Head2, Holo_Head3 }
+    
+    
+    function userHasGodMode(user)
+        if user:hasGodMode()
+                or (user.isBUILD != nil and user:isBUILD())
+                or (user.isSafezoneSafe != nil and user:isSafezoneSafe()) then
+            return true
+        end
+        local isKyleBuilder = user:getNWVar("_Kyle_Buildmode")
+        return isKyleBuilder != nil and isKyleBuilder
+    end
+    
+    
+    function isValidFindPlayerOrNPC(ent)
+        return ent ~= nil and ent:isValid()
+            and (ent:isPlayer() and ent:isValidPhys() and ent:isAlive() and !userHasGodMode(ent)
+                or ent:isNPC()) 
+    end
+    
+    
+    function isValidPlayerOrNPC(ent)
+        return ent ~= nil and ent:isValid()
+            and (ent:isNPC() or not IgnorePlayers and ent:isPlayer() and ent:isValidPhys() and ent:isAlive() and !userHasGodMode(ent))
+    end
+    
+    
+    function tryAddTarget(ent)
+        if not _targets[1] then _targets[1] = ent
+        elseif not _targets[2] then _targets[2] = ent
+        elseif not _targets[3] then _targets[3] = ent
+        elseif _targets[1]==_targets[2] then _targets[2] = ent
+        elseif _targets[1]==_targets[3] then _targets[3] = ent
+        elseif _targets[2]==_targets[3] then _targets[3] = ent
+        end
+    end
+    
+    
+    timer.create("preparating", 0.25, 0, function()
+        if not isValid(Prop_Base) or not isValid(Holo_Base) then return end
+        
+        if _isPreparating then
+            setBodyColor(Holo_Spine:getColor() == Color(18,14,24) and Color(60, 20, 80) or Color(18,14,24))   
+        else
+            setBodyColor(Color(18,14,24))
+            timer.remove("preparating")
+        end
+    end)
+    
+    
+    timer.create("auto_heal", AutoHealDelay, 0, function()
+        if not isValid(Prop_Base) or not isValid(Holo_Base) then return end
+        
+        if not _isAlive or _isPreparating or timer.systime() < _lastTakeDamage then return end
+        _health = math.clamp(_health + AutoHealAmount, 0, Health)
+        if _health > Health/2 then
+            setEnableShield(false)
+            _state = 1
+        end
+        sendHealth()
+    end)
+    
+    
+    timer.create("find_targets", 0.5, 0, function()
+        if not isValid(Prop_Base) or _isPreparating or not _isAlive then return end
+        
+        if not isValidPlayerOrNPC(_targets[1]) or Holo_Base:getPos():getDistance(_targets[1]:getPos()) > Radius then _targets[1] = nil end
+        if not isValidPlayerOrNPC(_targets[2]) or Holo_Base:getPos():getDistance(_targets[2]:getPos()) > Radius then _targets[2] = nil end
+        if not isValidPlayerOrNPC(_targets[3]) or Holo_Base:getPos():getDistance(_targets[3]:getPos()) > Radius then _targets[3] = nil end
+        
+        local ents = find.inSphere(Holo_Base:getPos(), Radius, isValidPlayerOrNPC)
+        
+        for i, ent in ipairs(ents) do
+            tryAddTarget(ent)
+        end
+    end)
+    
+    
+    function setEyeContact(holoHead, ent)
+        if not isValid(Prop_Base) or not isValid(Holo_Base) then return end
+        
+        if isValid(ent) and isValid(holoHead) then 
+            holoHead:setAngles((ent:obbCenterW()-holoHead:getPos()):getNormalized():getAngle()) 
+        end
+    end
+
+    
+    local _nextTimeFire = timer.systime()
+    hook.add("think", "heads", function()
+        if isValid(ent) and isValid(Prop_Base) or not isValid(Holo_Base) then return end
+        
+        for i, head in ipairs(_activeHeadFires) do
+            head:think()
+            if head.isExploded or head.isRemoved then
+                table.removeByValue(_activeHeadFires, head)
+            end
+        end
+        
+        if _isPreparating or not _isAlive then return end
+        
+        setEyeContact(Holo_Head1, _targets[1])
+        setEyeContact(Holo_Head2, _targets[2])
+        setEyeContact(Holo_Head3, _targets[3])
+        
+        if _nextTimeFire < timer.systime() then
+            _nextTimeFire = timer.systime() + MinRandomFire + math.random() * (MaxRandomFire-MinRandomFire)
+            local index = math.random(1, 3)
+            if isValid(_targets[index]) then
+                pcall(function()
+                    local headFire = HeadFire:new(_heads[index]:getPos(), Prop_Base, _targets[index], PropDamageMode)
+                    table.insert(_activeHeadFires, headFire)
+                    net.start("fire")
+                    net.send()
+                end)
+            end
+        end
+    end)
+
+
+    local _killingHoloAngle = 0
+    function killingScene()
+        local headFire = HeadFire:new(Prop_Base:getPos(), Prop_Base, owner(), true)
+        headFire:explode()
+        hook.add("think", "killingScene", function()
+            if not isValid(Prop_Base) or not isValid(Holo_Base) then return end
+            
+            Holo_Base:setAngles(Prop_Base:localToWorldAngles(Angle(20,0,_killingHoloAngle)))
+            
+            _killingHoloAngle = _killingHoloAngle + 2
+            if _killingHoloAngle > 90 then
+                hook.remove("think", "killingScene")
+                hideHolos()
+                setEnableShield(false)
+            end
+        end)
+    end
+
+
+    local _state2_avaliable_damagetypes = {
+        64,
+        4096,
+        67108865,
+        134217728,
+    }
+    function isEqualDamageType(type)
+        for i, f in ipairs(_state2_avaliable_damagetypes) do
+            if bit.band(type, f) != 0 then
+                return true
+            end
+        end
+        return false
+    end
+    
+    
+    hook.add("EntityTakeDamage", "dmg", function(target, attacker, inflictor, amount, type, position, force)
+        if not isValid(Prop_Base) 
+                or target != Prop_Base 
+                or attacker._isSF
+                or timer.systime() < _oldLockDamageTime 
+                or _isPreparating 
+                or not _isAlive
+                or _state == 2 and not isEqualDamageType(type) then return end
+                
+        _oldLockDamageTime = timer.systime() + LockDamageTime
+        _health = math.max(0, _health - math.clamp(amount, 0, MaxTakeDamage))
+        sendHealth()
+        _lastTakeDamage = timer.systime() + AutoHealAfterTime
+
+        if _health <= 0 then
+            _isAlive = false
+            killingScene()
+            timer.simple(DeathTime, function()
+                chip():remove()
+            end)
+        end
+    end)
+    
+    
+    local _HeightStep1 = 1200
+    local _HeightStep2 = 500
+    
+    function getTargetPos(ent)
+        local heightStep = _state == 1 and _HeightStep1 or _HeightStep2
+        local obbCentre = ent:obbCenterW()
+        local tr = trace.line(obbCentre, obbCentre + Vector(0,0,heightStep), nil, 24737, nil, false)
+        if tr.Hit then
+            heightStep = (tr.HitPos):getDistance(obbCentre) - 100
+        end
+        return ent:getPos() + Vector(0,0,heightStep)
+    end
+    
+    
+    local _oldDir = Vector()
+    hook.add("think", "main", function()
+        if not isValid(Holo_Tail_Bone) or not isValid(Holo_Base) then return end
+        
+        local systime = timer.systime()
+        local x = (systime * 2) % 360
+        
+        Holo_Tail_Bone:setAngles(Holo_Base:localToWorldAngles(Angle(math.sin(x)*15, 0, 0)))
+        
+        if isValid(Holo_Tentacle1_Bone) then
+            Holo_Tentacle1_Bone:setLocalAngles(Angle(math.sin(systime * 2) * 15, math.cos(systime * 3.5) * 20, 0))
+        end
+        if isValid(Holo_Tentacle2_Bone) then
+            Holo_Tentacle2_Bone:setLocalAngles(Angle(math.cos(systime * 2) * -15, math.sin(systime * 3.5) * 20, 0))
+        end
+        if isValid(Holo_Tentacle3_Bone) then
+            Holo_Tentacle3_Bone:setLocalAngles(Angle(math.sin(systime * 2.5) * 20, 0, math.cos(systime * 2) * 15))
+        end
+        
+        if not _isPreparating and _isAlive and isValid(Holo_Growth) then
+            if _growthScale < _maxGrowthScale then
+                _growthScale = _growthScale + (0.0003 * getFrameTime())
+                Holo_Growth:setScale(Vector(15, 15, 15) * _growthScale)
+                
+                local growthFactor = _growthScale + ((_growthScale - 1) * 0.5)
+                local backwardOffset = -40 - (growthFactor * 45)
+                local verticalOffset = 15 + (growthFactor * 55)
+                
+                Holo_Growth:setPos(Holo_Spine:localToWorld(Vector(backwardOffset, 0, verticalOffset)))
+            end
+        end
+        
+        if AiFlyEnabled and not _isPreparating and _isAlive then
+            local targetPos
+            local curPos = Prop_Base:getPos()
+            
+            if isValidPlayerOrNPC(_targets[1]) then
+                targetPos = getTargetPos(_targets[1])
+                _wanderPos = nil 
+            else
+                if not _wanderPos or curPos:getDistance(_wanderPos) < 150 or timer.systime() > _nextWanderTime then
+                    local randomOffset = Vector(math.random(-1000, 1000), math.random(-1000, 1000), math.random(-200, 500))
+                    _wanderPos = curPos + randomOffset
+                    _nextWanderTime = timer.systime() + 12
+                end
+                targetPos = _wanderPos
+            end
+            
+            local distance = targetPos:getDistance(curPos)
+            if distance > 20 then
+                local currentDir = _oldDir
+                local targetDir = (targetPos - curPos):getNormalized()
+                local nextDir = math.lerpVector(FlyHomingAccuracy/10, currentDir, targetDir)
+                _oldDir = nextDir
+                
+                local nextStepDistance = math.clamp(distance/100, 0, isValidPlayerOrNPC(_targets[1]) and FlyVelocityMax or (FlyVelocityMax * 0.4))
+                local nextPos = curPos + nextDir * nextStepDistance * getFrameTime()
+                
+                local wallTrace = trace.line(curPos, nextPos, {Prop_Base}, MASK.SOLID, nil, false)
+                if wallTrace.Hit then
+                    nextPos = wallTrace.HitPos + wallTrace.HitNormal * 15
+                    _wanderPos = nil
+                end
+                
+                local nextAng = nextDir:getAngle()
+                nextAng.p = 0
+                
+                _propPhysObj:wake()
+                _propPhysObj:setAngles(nextAng)
+                _propPhysObj:setPos(nextPos)
+            end
+        end
+    end)
+    
+
+    local _prepTime = timer.curtime()
+    local _prepTimeEnd = timer.curtime() + PreparationTime
+    timer.simple(PreparationTime, function()
+        if not isValid(Prop_Base) or not isValid(Holo_Base) then return end
+        
+        local headFire = HeadFire:new(Prop_Base:getPos(), Prop_Base, owner(), true)
+        headFire:explode()
+        timer.simple(0.3, function()
+            _isPreparating = false
+            _health = Health
+            setEnableShield(false)
+        end)
+    end)
+    
+
+    hook.add("ClientInitialized", "cl_init", function(ply)
+        net.start("init")
+        net.writeFloat(_prepTime)
+        net.writeEntity(Holo_Base)
+        net.send(ply)
+    end)
+    
+    return
+end
+
+------------------------------------ CLIENT  --------------------------------------------------
+
+local RenderOn = true
+local _prepServerTime, _prepTimeEnd
+
+local sounds_main = {}
+local soundUrls_main = {
+    idle1 = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/idle1-wither.mp3",
+    idle2 = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/idle2-wither.mp3",
+    idle3 = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/idle3-wither.mp3",
+    idle4 = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/idle4-wither.mp3",
+}
+
+local sounds_hurt = {}
+local soundUrls_hurt = {
+    hurt1 = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/hurt1-wither.mp3",
+    hurt2 = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/hurt2-wither.mp3",
+    hurt3 = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/hurt3-wither.mp3",
+    hurt4 = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/hurt4-wither.mp3",
+}
+
+local sounds_other = {}
+local soundUrls_other = {
+    spawn = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/spawn-wither.mp3",
+    death = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/death---wither-By-tuna.voicemod.net.mp3",
+    shoot = "https://raw.githubusercontent.com/Indecastle/Garrys-mod/master/starfall/Resources/wither/shoot-wither.mp3",
+    theme = "https://raw.githubusercontent.com/skylerduncan093-oss/wither-storm-theme-for-starfall/main/wither-storm-theme-minecraft-story-mode-101-ost.mp3",
+}
+
+
+net.receive("init", function(len)
+    _prepServerTime = net.readFloat()
+    _prepTimeEnd = _prepServerTime+ PreparationTime
+    net.readEntity(function(ent)
+        if ent==nil then error("Failed to get Hologram!") end
+        Holo_Base = ent
+    end)
+    
+    hook.add("think", "preparation", function()
+        _health = math.clamp(Health * (1 - (_prepTimeEnd - timer.curtime()) / PreparationTime), 0, Health)
+        if _health == Health then
+            _isPreparating = false
+            hook.remove("think", "preparation")
+            
+            sounds_other.spawn:setPos(chip():getPos())
+            sounds_other.spawn:play()
+            
+            if sounds_other.theme then
+                sounds_other.theme:setLooping(true)
+                sounds_other.theme:setPos(chip():getPos())
+                sounds_other.theme:play()
+            end
+        end
+    end)
+end)
+
+
+net.receive("fire", function(len)
+    local sound = sounds_other.shoot
+    sound:setPos(Holo_Base:getPos())
+    sound:pause()
+    sound:setTime(0)
+    sound:play()
+end)
+
+
+net.receive("hurt", function(len)
+    if not isValid(Holo_Base) then return end
+    
+    local newHealth = net.readFloat()
+    
+    if newHealth > 0 then
+        if newHealth < _health then
+            local sound = table.random(sounds_hurt)
+            sound:setPos(Holo_Base:getPos())
+            sound:pause()
+            sound:setTime(0)
+            sound:play()
+        end
+    else
+        _isAlive = false
+        
+        if sounds_other.theme then
+            sounds_other.theme:stop()
+        end
+        
+        local sound = sounds_other.death
+        sound:setPos(Holo_Base:getPos())
+        sound:play()
+    end
+    _health = newHealth
+end)
+
+
+function loadUrl(name, url, ar, volume, temp, isDict, callback)
+    if temp > 5 then 
+        return 
+    end
+    
+    bass.loadURL(url, "3d noblock noplay", function(Sound)
+        if !isValid(Sound) then
+            timer.simple(AgainLoadSoundDelay, function()
+                loadUrl(name, url, ar, volume, temp + 1, isDict, callback)
+            end)
+            return 
+        end
+        
+        if isDict then
+            ar[name] = Sound
+        else
+            table.insert(ar, Sound)
+        end
+        
+        Sound:setLooping(false)
+        if name == "theme" then
+            Sound:setPitch(1.0)
+        else
+            Sound:setPitch(Speed)
+        end
+        Sound:setVolume(volume) 
+        Sound:setFade(1000, 10000)
+        
+        if callback then
+            callback(name, url, Sound)
+        end
+    end)
+    
+end
+
+
+for k, url in pairs(soundUrls_main) do
+    loadUrl(k, url, sounds_main, SoundVolumeMain, 0)
+end
+for k, url in pairs(soundUrls_hurt) do
+    loadUrl(k, url, sounds_hurt, SoundVolumeHurt, 0)
+end
+loadUrl('spawn', soundUrls_other.spawn, sounds_other, SoundVolumeSpawn, 0, true)
+loadUrl('death', soundUrls_other.death, sounds_other, SoundVolumeDeath, 0, true)
+loadUrl('shoot', soundUrls_other.shoot, sounds_other, SoundVolumeShoot, 0, true)
+loadUrl('theme', soundUrls_other.theme, sounds_other, 1.0, 0, true)
+
+
+timer.create("main", 10, 0, function()
+    if not isValid(Holo_Base) or not _isAlive then return end
+    
+    local sound = table.random(sounds_main)
+    sound:setPos(Holo_Base:getPos())
+    sound:play()
+    
+    if sounds_other.theme and _isAlive then
+        sounds_other.theme:setPos(Holo_Base:getPos())
+    end
+end)
+
+------------------------------------ Render  --------------------------------------------------
+
+local text = render.createFont("Arial" 
+                                    ,25 
+                                    ,100 
+                                    ,false 
+                                    ,false 
+                                    ,false 
+                                    ,false 
+                                    ,false 
+                                    ,false 
+                                    )
+render.createRenderTarget("template")
+render.createRenderTarget("screen")
+render.createRenderTarget("TargetScreen")
+    
+local m = material.create("VertexLitGeneric")
+m:setTextureRenderTarget("$basetexture", "TargetScreen")
+
+local VertexAlpha= false
+local VertexColor= false
+local AlphaTest= false
+local Additive= HaveAlpha
+local Translucent= false
+
+local flags = 
+    (VertexColor and 16 or 0) +
+    (VertexAlpha and 32 or 0) +
+    (Additive and 128 or 0) +
+    (AlphaTest and 256 or 0) +
+    (Translucent and 2097152 or 0)
+    
+    
+if flags ~= 0 then
+    m:setInt("$flags",  
+        flags)    
+end
+m:recompute()
+
+
+local holo = hologram.create(chip():getPos(), chip():getAngles(), "models/holograms/plane.mdl", Vector(1))
+holo:setColor(Color(0,0,0,1))
+holo:setMaterial("!" .. m:getName())
+holo:suppressEngineLighting(true)
+
+
+function filterImage()
+    render.setFilterMin(1)
+    render.setFilterMag(1)
+end
+
+
+local IsRect = true
+local _oldFOV = 0
+function fovHandler(newFOV)
+    if _oldFOV == newFOV then return end
+    _oldFOV = newFOV
+    
+    local ResK = Height / Width
+    FovH = newFOV * math.pi / 180
+    FovV = 2 * math.atan(math.tan(FovH/2) / ResK)
+    
+    local _w = 2 * RenderOffset * math.tan(FovV/2)
+    local _h = 2 * RenderOffset * math.tan(FovH/2)
+    
+    local kk = IsRect and (Height/Width) or 1
+
+    holo:setSize(Vector(_h*0.565, _w*0.565 * kk, 1))
+end
+
+
+hook.add("renderoffscreen", "InitTemplate", function()
+    hook.remove("renderoffscreen", "InitTemplate")
+    
+    Width, Height = render.getGameResolution()
+    
+    render.selectRenderTarget("template")
+    
+    render.clear(Color(0,0,0,0))
+    
+    render.setFont(text)
+    render.setColor(Color(255,255,255,255))
+    render.drawText(512, 20, "Wither Storm", 1)
+    
+    local _k = 0.3
+    render.setColor(Color(150*_k,100*_k,255*_k))
+    render.drawRoundedBox(100, 512-200, 50, 400, 8)
+
+end)
+
+
+hook.add("renderoffscreen", "Camera", function()
+    
+    render.selectRenderTarget("screen")
+    render.clear(Color(0,0,0,0))
+
+    render.setRenderTargetTexture("template")
+    filterImage()
+    render.drawTexturedRect(0,0,1024,1024)
+    
+    render.setColor(Color(150,100,255))
+    render.drawRoundedBox(100, 512-200, 50, 400*(_health/Health), 8)
+    render.setColor(Color(255,255,255,255))
+end)
+
+
+hook.add("renderoffscreen", "", function()
+    
+    render.selectRenderTarget("TargetScreen")
+    render.clear(Color(0, 0, 0, 0))
+    
+    render.setRenderTargetTexture("screen")
+    filterImage()
+    render.drawTexturedRect(0,0,1024,1024)
+    render.setColor(Color(255,255,255,255))
+end)
+
+
+hook.add("renderscene", "setPos", function(origin, angles, fov)
+    if not isValid(Holo_Base) then return end
+    
+    local inSphere = Holo_Base:getPos():getDistance(origin) < RenderRadius
+    
+    if RenderOn and inSphere then
+        fovHandler(fov)
+        
+        local _, eyeA = localToWorld(Vector(), Angle(90,0,180), Vector(), angles)
+        
+        holo:setPos(origin + angles:getForward()*RenderOffset)
+        holo:setAngles(eyeA)
+        
+        local distance = Holo_Base:getPos():getDistance(origin)
+        local x = math.clamp((math.abs(distance-RenderRadius) / RenderRadius), 0, 0.99)*RenderMaxAlpha
+
+        holo:setColor(Color(255,255,255, 255*x))
+    else
+        holo:setPos(Vector())
+    end
+end)
